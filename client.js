@@ -877,9 +877,18 @@ window.__ModuleLoader__.load({
           React.createElement('div', { className: 'ag-set-card-head' },
             React.createElement('div', { className: 'ag-set-card-title' },
               React.createElement('span', { className: 'ag-set-stage' }, '⑤ 学习沉淀'),
-              '正在学习'),
+              '正在学习',
+              React.createElement('span', { className: 'ag-snap-bar-spacer' }),
+              React.createElement('button', {
+                type: 'button', className: 'ag-set-btn', disabled: busy || (statKeys.length === 0 && Object.keys(learnHistory).length === 0),
+                title: '清空所有学习项的确认计数与样本（已沉淀的白名单规则不受影响）',
+                onClick: function () {
+                  if (!window.confirm('重置全部学习状态？将清空所有确认计数与样本（已沉淀的白名单规则不受影响）。')) return
+                  api({ op: 'reset', kind: 'learning' })
+                },
+              }, '全部重置')),
             React.createElement('p', { className: 'ag-set-card-sub' },
-              '中立操作人工确认制：同一「工具|模式|类别」每确认一次计数 +1，确认满 ' + cfg.riskyThreshold + ' 次后，第 ' + (cfg.riskyThreshold + 1) + ' 次起自动放行并沉淀规则。若学习有误可终止（删除计数与样本）。')),
+              '中立操作人工确认制：同一「工具|模式|类别」每确认一次计数 +1，确认满 ' + cfg.riskyThreshold + ' 次后，第 ' + (cfg.riskyThreshold + 1) + ' 次起自动放行并沉淀规则。若学习有误可终止单项或全部重置（删除计数与样本）。')),
           statKeys.length === 0
             ? React.createElement('div', { className: 'ag-set-empty' }, '暂无正在学习的内容')
             : React.createElement('div', { className: 'ag-set-learn' },

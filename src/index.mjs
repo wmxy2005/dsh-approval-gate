@@ -619,7 +619,7 @@ function ensureAutoApprovePreset() {
   }
 }
 
-/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs */
+/** 规则修改：op=add|remove|set|reset，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs|learning */
 function applyRuleOp(op, kind, value) {
   reloadConfig()
 
@@ -636,9 +636,17 @@ function applyRuleOp(op, kind, value) {
 
   const list = config[kind]
   if (!Array.isArray(list)) {
-    // 学习状态终止：kind='learning'，value=key（tool|mode|category）
+    // 学习状态终止：kind='learning'，op='remove' value=key（tool|mode|category）；op='reset' 清空全部
     if (kind === 'learning') {
-      if (op !== 'remove') return { ok: false, error: 'learning 仅支持 remove' }
+      if (op === 'reset') {
+        const count = new Set([...Object.keys(learning.stats), ...Object.keys(learning.history)]).size
+        learning.stats = {}
+        learning.history = {}
+        saveJson(LEARNING_PATH, learning)
+        audit(`LEARN   用户重置全部学习状态（${count} 项）`)
+        return { ok: true, reset: count }
+      }
+      if (op !== 'remove') return { ok: false, error: 'learning 仅支持 remove / reset' }
       const key = String(value || '').trim()
       if (!key) return { ok: false, error: 'key 不能为空' }
       if (learning.stats[key] !== undefined || learning.history[key] !== undefined) {
