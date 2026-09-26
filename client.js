@@ -137,12 +137,13 @@ window.__ModuleLoader__.load({
 
     const VERDICT_LABELS = {
       rule: '白名单规则',
+      readonly: '只读命令',
       'flash-safe': 'Flash 判定安全',
       learned: '沉淀规则',
       fpHit: '已确认操作',
       'flash-same': 'Flash 同类验证'
     }
-    const VERDICT_NEUTRAL = new Set(['rule', 'learned', 'fpHit', 'flash-same'])
+    const VERDICT_NEUTRAL = new Set(['rule', 'readonly', 'learned', 'fpHit', 'flash-same'])
     const HARD_CATEGORIES = new Set(['deletion', 'credential', 'remote', 'system', 'bulk'])
 
     // 拒绝记录文案：按 host 记录的 path（判定路径）精确分类

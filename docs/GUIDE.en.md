@@ -7,12 +7,13 @@ DeepSeek Harness auto-approval gate plugin v0.5.0: **minimal human intervention 
 When a session's permission preset is `auto-approve` (Auto Approval (Flash)), every approval request (sandbox escalation) is judged through this pipeline:
 
 ```
-DENY (irreversible keywords) → allowlist (deterministic rules) → denyRules (rejected upgrades) → flash (SAFE / hard categories / neutral confirmation) → learned persistence
+DENY (irreversible keywords) → read-only commands → allowlist (deterministic rules) → denyRules (rejected upgrades) → flash (SAFE / hard categories / neutral confirmation) → learned persistence
 ```
 
 The "actual command" used for judgment: the plugin follows `callId` back to the session's `tool/call` event and reads the `command` argument of bash/pwsh-style tools, instead of relying only on the model's own justification.
 
 - **① DENY layer**: irreversible keywords (`rm -rf`, `drop table`, `force push`, formatting, …) in the justification or the actual command → human (**highest priority, fail-safe**)
+- **①½ Read-only command layer**: read-only commands (`git status/diff/log/show`, `node --check`, `ls`, `cat`, …) → auto-approve. Compound commands are split on `;` `&&` `||` `|` and approved only if every segment is read-only (pipes may feed output-only commands such as `Select-Object`, `Write-Host`, `Format-List`); redirection, command substitution, script blocks or `--output` are never read-only. Set `"readOnlyCommands": false` in `allowlist.json` to disable
 - **② Allowlist layer**: a matching rule → auto-approve (deterministic, no LLM). Default rule `{mode:"workspace-write"}` — workspace writes (recoverable) auto-approve; `tool/mode/category/contains/command` combinations are supported (including learned rules)
 - **③ denyRules layer**: `tool+mode+category` pairs the user has **explicitly rejected** → permanently human (never auto-approve what the user refused)
 - **④ flash judgment** (escalations only): outputs `SAFE` or `RISKY:<category>`

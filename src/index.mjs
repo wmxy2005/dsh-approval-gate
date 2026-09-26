@@ -323,6 +323,87 @@ function commandOf(args) {
   return String(args.command || args.cmd || args.script || '').trim()
 }
 
+// 内置只读命令前缀（只读白名单）。按「首词 + 子命令」前缀匹配，大小写不敏感。
+const READONLY_COMMAND_PREFIXES = [
+  'git status', 'git diff', 'git log', 'git show', 'git branch --list', 'git branch -a', 'git branch -v',
+  'git remote -v', 'git rev-parse', 'git ls-files', 'git blame', 'git describe', 'git tag --list', 'git stash list',
+  'node --check', 'node -v', 'node --version', 'npm -v', 'npm --version', 'npm ls', 'npm view',
+  'pnpm -v', 'pnpm --version', 'pnpm ls', 'ls', 'dir', 'pwd', 'cat', 'type', 'head', 'tail',
+  'wc', 'grep', 'rg', 'findstr', 'get-content', 'get-childitem', 'get-location', 'select-string',
+  'test-path', 'where', 'which', 'whoami', 'echo', 'write-host', 'write-output'
+]
+
+// 管道/串联中允许出现的纯输出命令（只加工前一段命令的输出，不读写文件）
+const OUTPUT_ONLY_COMMANDS = [
+  'select-object', 'sort-object', 'out-string', 'format-list', 'format-table', 'format-wide',
+  'measure-object', 'out-host', 'more', 'sort', 'uniq', 'head', 'tail', 'wc', 'cat', 'grep', 'rg',
+  'select-string', 'findstr', 'write-host', 'write-output', 'echo'
+]
+
+/**
+ * 按引号感知拆分复合命令：在引号外按 `;` `&&` `||` `|` 切段。
+ * 引号外出现重定向 `>` `<`、反引号、`$(`，或双引号内出现 `$(` / 反引号（命令替换）→ 返回 null（不可判定）。
+ * 常见的 stderr 抑制（2>$null、2>/dev/null、2>&1）先剥离，不视为写文件。
+ * @param {string} cmd 命令文本
+ * @returns {string[]|null} 各段命令（已 trim，非空）；不可判定返回 null
+ */
+function splitCompoundCommand(cmd) {
+  const s = String(cmd || '').replace(/\s2>(?:\$null|\/dev\/null|&1)/gi, ' ')
+  const segments = []
+  let cur = ''
+  let quote = ''
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (quote) {
+      if (quote === '"' && (ch === '`' || (ch === '$' && s[i + 1] === '('))) return null
+      if (ch === quote) quote = ''
+      cur += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue }
+    if (ch === '>' || ch === '<' || ch === '`' || ch === '{' || ch === '\n' || ch === '\r') return null
+    if (ch === '$' && s[i + 1] === '(') return null
+    if (ch === ';' || ch === '|' || ch === '&') {
+      // && / || 视为一个分隔符；单个 & 在 bash 为后台、在 pwsh 为调用运算符 → 不可判定
+      if (ch === '&' && s[i + 1] !== '&') return null
+      if ((ch === '&' || ch === '|') && s[i + 1] === ch) i++
+      segments.push(cur.trim())
+      cur = ''
+      continue
+    }
+    cur += ch
+  }
+  if (quote) return null
+  segments.push(cur.trim())
+  return segments.some((seg) => !seg) ? null : segments
+}
+
+/** 单段命令（无分隔符）是否命中只读前缀 */
+function isReadOnlySegment(seg, extra) {
+  const lower = seg.toLowerCase().replace(/\s+/g, ' ')
+  // --output 可让 git diff/log 写文件；--ext-diff 可执行外部程序
+  if (/--output\b|--ext-diff\b/.test(lower)) return false
+  // git 全局参数（-C <dir> / -c k=v / --no-pager）剥离后再匹配子命令
+  const normalized = lower.replace(/^git (?:(?:-c (?:"[^"]*"|'[^']*'|\S+)|--no-pager) )+/, 'git ')
+  const hit = (p) => normalized === p || normalized.startsWith(p + ' ')
+  return READONLY_COMMAND_PREFIXES.some(hit) || (extra ? extra.some(hit) : false)
+}
+
+/**
+ * 判断命令是否只读：单条只读命令，或由 `;` `&&` `||` `|` 串起的多段、每段都只读
+ * （首段须命中只读前缀，管道后续段还可以是纯输出命令，如 Select-Object / Write-Host）。
+ * 含重定向、命令替换、脚本块的命令一律不算只读，交给后续判定链。
+ * @param {string} cmd 命令文本
+ * @returns {boolean}
+ */
+function isReadOnlyCommand(cmd) {
+  const s = String(cmd || '').trim()
+  if (!s || s.length > 1000) return false
+  const segments = splitCompoundCommand(s)
+  if (!segments) return false
+  return segments.every((seg, i) => isReadOnlySegment(seg, i === 0 ? null : OUTPUT_ONLY_COMMANDS))
+}
+
 /**
  * 从 approval/request 的 callId 回溯会话日志中的 tool/call 事件，取结构化参数里的真实路径。
  * B 层：edit/write/select 等带 file_path 字段的工具 → 解析 arguments JSON 拿确凿路径；
@@ -1426,6 +1507,13 @@ export default {
         if (looksDeny(toolName + ' ' + reason + ' ' + commandForDeny(command))) {
           audit(`DENY    ${toolName} mode=${mode || 'none'}${cmdTag} | ${reason.slice(0, 160)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'deny')
+        }
+
+        // 1.5 只读命令层：只读命令（含每段都只读的复合命令，如 git status; git diff）→ 直接放行（确定性，不过 flash）
+        if (config.readOnlyCommands !== false && isReadOnlyCommand(command)) {
+          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (readonly)${cmdTag}`)
+          recordAutoAllow(sessionId, toolName, mode, reason, justification, 'readonly', filesOpt)
+          return 'allowed-once'
         }
 
         // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）

@@ -7,12 +7,13 @@ DeepSeek Harness 自动审批门控插件 v0.5.0：**最小人工介入，只把
 当会话的权限预设为 `auto-approve`（自动审批（Flash））时，每次审批请求（沙箱越界）按管道判定：
 
 ```
-DENY（不可逆危险词）→ 白名单（确定性规则）→ denyRules（裁决拒绝升级）→ flash（SAFE / 硬类别 / 中立确认）→ 学习沉淀
+DENY（不可逆危险词）→ 只读命令 → 白名单（确定性规则）→ denyRules（裁决拒绝升级）→ flash（SAFE / 硬类别 / 中立确认）→ 学习沉淀
 ```
 
 判定使用的「实际命令」：插件按 `callId` 回溯会话里的 `tool/call` 事件，取 bash/pwsh 等工具参数中的 `command`，不只依赖模型自述的 justification。
 
 - **① DENY 层**：`rm -rf` / `drop table` / `force push` / 格式化等不可逆危险词（在理由和实际命令中）命中 → 转人工（**最高优先，fail-safe**）
+- **①½ 只读命令层**：只读命令（`git status/diff/log/show`、`node --check`、`ls`、`cat` 等）→ 直接放行。复合命令按 `;` `&&` `||` `|` 拆段，每段都只读才放行（管道后可接 `Select-Object`、`Write-Host`、`Format-List` 等纯输出命令）；含重定向、命令替换、脚本块或 `--output` 的不算只读。`allowlist.json` 设 `"readOnlyCommands": false` 可关闭
 - **② 白名单层**：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 `{mode:"workspace-write"}` —— 工作区写入（可回补）自动放行；也支持 `tool/mode/category/contains/command` 组合规则（含学习沉淀的规则）
 - **③ denyRules 层**：此前用户**裁决拒绝**过的「工具+模式+类别」→ 永久转人工（不会自动放行用户明确拒绝过的操作）
 - **④ flash 判定**（仅越界请求）：输出 `SAFE` 或 `RISKY:<category>`
