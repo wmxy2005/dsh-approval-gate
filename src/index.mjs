@@ -285,6 +285,20 @@ function extractFiles(text) {
 }
 
 /**
+ * 读取会话事件列表：新版 DSH 为 session.snapshotEvents()，旧版为 session.events 数组。
+ * @param {object} session DSH Session
+ * @returns {Array} 事件数组（取不到返回空数组）
+ */
+function sessionEventsOf(session) {
+  if (!session) return []
+  if (Array.isArray(session.events)) return session.events
+  if (typeof session.snapshotEvents === 'function') {
+    try { return session.snapshotEvents() } catch { return [] }
+  }
+  return []
+}
+
+/**
  * 从 approval/request 的 callId 回溯会话日志中的 tool/call 事件，取结构化参数里的真实路径。
  * B 层：edit/write/select 等带 file_path 字段的工具 → 解析 arguments JSON 拿确凿路径；
  * bash/exec 等带 command 字段的工具 → 从命令文本提取路径。
@@ -1304,11 +1318,13 @@ export default {
         const reason = String(req.reason || '')
         const { mode, justification } = parseReason(reason)
         const sessionId = typeof session.id === 'string' ? session.id : ''
-        // 会话工作目录：相对路径快照解析的基准（DSH SessionHeader.cwd）
-        const sessionCwd = (typeof session.cwd === 'string' && session.cwd) ? session.cwd : ''
+        // 会话工作目录：相对路径快照解析的基准（新版 DSH 在 session.header.cwd，旧版 session.cwd）
+        const rawCwd = (session.header && session.header.cwd) || session.cwd
+        const sessionCwd = (typeof rawCwd === 'string' && rawCwd) ? rawCwd : ''
+        const events = sessionEventsOf(session)
         // B 层：callId 回溯 tool/call 事件取结构化真实路径（edit/write 的 file_path / bash 的 command）
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
-        const toolFiles = resolveToolCallFiles(req.callId, session.events)
+        const toolFiles = resolveToolCallFiles(req.callId, events)
         const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
