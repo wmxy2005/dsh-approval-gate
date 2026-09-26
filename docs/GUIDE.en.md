@@ -10,8 +10,10 @@ When a session's permission preset is `auto-approve` (Auto Approval (Flash)), ev
 DENY (irreversible keywords) → allowlist (deterministic rules) → denyRules (rejected upgrades) → flash (SAFE / hard categories / neutral confirmation) → learned persistence
 ```
 
-- **① DENY layer**: irreversible keywords (`rm -rf`, `drop table`, `force push`, formatting, …) → human (**highest priority, fail-safe**)
-- **② Allowlist layer**: a matching rule → auto-approve (deterministic, no LLM). Default rule `{mode:"workspace-write"}` — workspace writes (recoverable) auto-approve; `tool/mode/category/contains` combinations are supported (including learned rules)
+The "actual command" used for judgment: the plugin follows `callId` back to the session's `tool/call` event and reads the `command` argument of bash/pwsh-style tools, instead of relying only on the model's own justification.
+
+- **① DENY layer**: irreversible keywords (`rm -rf`, `drop table`, `force push`, formatting, …) in the justification or the actual command → human (**highest priority, fail-safe**)
+- **② Allowlist layer**: a matching rule → auto-approve (deterministic, no LLM). Default rule `{mode:"workspace-write"}` — workspace writes (recoverable) auto-approve; `tool/mode/category/contains/command` combinations are supported (including learned rules)
 - **③ denyRules layer**: `tool+mode+category` pairs the user has **explicitly rejected** → permanently human (never auto-approve what the user refused)
 - **④ flash judgment** (escalations only): outputs `SAFE` or `RISKY:<category>`
   - `SAFE` → auto-approve
@@ -20,7 +22,7 @@ DENY (irreversible keywords) → allowlist (deterministic rules) → denyRules (
 - **⑤ Learned persistence** (neutral, N=3: confirm twice, then threshold state)
   - Before threshold: every occurrence goes to human; **approve** → count +1 and record an **operation sample** (fingerprint + context); **reject** → upgrade to denyRules
   - At threshold (count ≥ N-1), three branches:
-    1. **Fingerprint hit** (this operation is in the confirmed samples) → auto-approve + persist a `{tool, mode, category, contains}` rule
+    1. **Fingerprint hit** (this operation is in the confirmed samples) → auto-approve + persist a rule: with an actual command the fingerprint is its prefix (e.g. `git diff`), persisted as `{tool, mode, category, command}`; otherwise a path/file name from the justification, persisted as `{tool, mode, category, contains}`
     2. **No fingerprint hit but samples exist** → hand the current operation's context plus the confirmed samples to flash for **third-party similarity verification**: `SAME` (same kind as a confirmed sample) → auto-approve (persist when a fingerprint exists); `DIFFERENT` / verification failure → human
     3. **No samples** → human
   - **Reject** → upgraded to denyRules (with fingerprint; without one, block the whole kind — rejection is always strict)
@@ -97,7 +99,7 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
 ```
 
 - `denyKeywords`: a hit sends the request to human (irreversible operations)
-- `allowRules`: each rule matches on `tool` / `mode` / `category` / `contains` (omitted fields match anything). Learned rules are also written here
+- `allowRules`: each rule matches on `tool` / `mode` / `category` / `contains` / `command` (omitted fields match anything). `contains` matches the justification or the actual command; `command` is a prefix of the actual command (e.g. `git status`; compound commands never match). Note `tool` is the tool name (e.g. `pwsh`, `bash`), not the command name. Learned rules are also written here
 - `denyRules`: written automatically after a human rejection; a hit goes to human (no learning)
 - `hardCategories`: flash `RISKY` in these categories → directly human (no counting, no learning)
 - `riskyThreshold`: neutral confirmation threshold (default 3) — after N-1 human confirmations of the same tool+mode+category, the Nth occurrence auto-approves and persists a rule

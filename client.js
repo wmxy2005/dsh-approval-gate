@@ -640,7 +640,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [feedback, setFeedback] = React.useState(null)
       const [newKeyword, setNewKeyword] = React.useState('')
-      const [newRule, setNewRule] = React.useState({ tool: '', mode: '', category: '', contains: '' })
+      const [newRule, setNewRule] = React.useState({ tool: '', mode: '', category: '', contains: '', command: '' })
       const [threshold, setThreshold] = React.useState('3')
       const [timeoutMs, setTimeoutMs] = React.useState('20000')
 
@@ -803,11 +803,12 @@ window.__ModuleLoader__.load({
             React.createElement('input', { className: 'ag-set-input', style: { width: 150 }, placeholder: 'mode（可选）', value: newRule.mode, onChange: function (e) { setNewRule(Object.assign({}, newRule, { mode: e.target.value })) } }),
             React.createElement('input', { className: 'ag-set-input', style: { width: 110 }, placeholder: 'category（可选）', value: newRule.category, onChange: function (e) { setNewRule(Object.assign({}, newRule, { category: e.target.value })) } }),
             React.createElement('input', { className: 'ag-set-input', style: { width: 130 }, placeholder: 'contains（可选）', value: newRule.contains, onChange: function (e) { setNewRule(Object.assign({}, newRule, { contains: e.target.value })) } }),
+            React.createElement('input', { className: 'ag-set-input', style: { width: 130 }, placeholder: 'command 前缀（可选）', title: '实际命令前缀匹配，如 git status；复合命令不匹配', value: newRule.command, onChange: function (e) { setNewRule(Object.assign({}, newRule, { command: e.target.value })) } }),
             React.createElement('button', {
-              type: 'button', className: 'ag-set-btn ag-set-btn-primary', disabled: busy || !(newRule.tool || newRule.mode || newRule.category || newRule.contains),
+              type: 'button', className: 'ag-set-btn ag-set-btn-primary', disabled: busy || !(newRule.tool || newRule.mode || newRule.category || newRule.contains || newRule.command),
               onClick: function () {
                 api({ op: 'add', kind: 'allowRules', value: newRule })
-                setNewRule({ tool: '', mode: '', category: '', contains: '' })
+                setNewRule({ tool: '', mode: '', category: '', contains: '', command: '' })
               },
             }, '添加'),
           ),
@@ -820,6 +821,7 @@ window.__ModuleLoader__.load({
                   if (rule.mode) parts.push('mode=' + rule.mode)
                   if (rule.category) parts.push('category=' + rule.category)
                   if (rule.contains) parts.push('contains=' + rule.contains)
+                  if (rule.command) parts.push('command=' + rule.command)
                   const label = parts.join('  ') || '(任意)'
                   const src = ruleSource(rule)
                   const isPre = preAllow.indexOf(JSON.stringify({ mode: rule.mode, description: rule.description })) >= 0 || (rule.mode === 'workspace-write' && !rule.tool && !rule.category && !rule.contains)
@@ -830,7 +832,7 @@ window.__ModuleLoader__.load({
                     React.createElement('button', {
                       type: 'button', className: 'ag-set-item-del', title: '删除', 'aria-label': '删除规则',
                       onClick: function () {
-                        api({ op: 'remove', kind: 'allowRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains } })
+                        api({ op: 'remove', kind: 'allowRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains, command: rule.command } })
                       },
                     }, '✕'),
                   )
@@ -855,12 +857,13 @@ window.__ModuleLoader__.load({
                   if (rule.mode) parts.push('mode=' + rule.mode)
                   if (rule.category) parts.push('category=' + rule.category)
                   if (rule.contains) parts.push('contains=' + rule.contains)
+                  if (rule.command) parts.push('command=' + rule.command)
                   return React.createElement('div', { className: 'ag-set-item', key: idx },
                     React.createElement('span', { className: 'ag-set-item-label' }, parts.join('  ') || '(任意)'),
                     React.createElement('button', {
                       type: 'button', className: 'ag-set-item-del', title: '移除', 'aria-label': '移除规则',
                       onClick: function () {
-                        api({ op: 'remove', kind: 'denyRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains } })
+                        api({ op: 'remove', kind: 'denyRules', value: { tool: rule.tool, mode: rule.mode, category: rule.category, contains: rule.contains, command: rule.command } })
                       },
                     }, '✕'),
                   )

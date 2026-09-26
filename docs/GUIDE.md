@@ -10,8 +10,10 @@ DeepSeek Harness 自动审批门控插件 v0.5.0：**最小人工介入，只把
 DENY（不可逆危险词）→ 白名单（确定性规则）→ denyRules（裁决拒绝升级）→ flash（SAFE / 硬类别 / 中立确认）→ 学习沉淀
 ```
 
-- **① DENY 层**：`rm -rf` / `drop table` / `force push` / 格式化等不可逆危险词命中 → 转人工（**最高优先，fail-safe**）
-- **② 白名单层**：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 `{mode:"workspace-write"}` —— 工作区写入（可回补）自动放行；也支持 `tool/mode/category/contains` 组合规则（含学习沉淀的规则）
+判定使用的「实际命令」：插件按 `callId` 回溯会话里的 `tool/call` 事件，取 bash/pwsh 等工具参数中的 `command`，不只依赖模型自述的 justification。
+
+- **① DENY 层**：`rm -rf` / `drop table` / `force push` / 格式化等不可逆危险词（在理由和实际命令中）命中 → 转人工（**最高优先，fail-safe**）
+- **② 白名单层**：命中规则 → 直接放行（确定性，不过 LLM）。默认规则 `{mode:"workspace-write"}` —— 工作区写入（可回补）自动放行；也支持 `tool/mode/category/contains/command` 组合规则（含学习沉淀的规则）
 - **③ denyRules 层**：此前用户**裁决拒绝**过的「工具+模式+类别」→ 永久转人工（不会自动放行用户明确拒绝过的操作）
 - **④ flash 判定**（仅越界请求）：输出 `SAFE` 或 `RISKY:<category>`
   - `SAFE` → 自动放行
@@ -20,7 +22,7 @@ DENY（不可逆危险词）→ 白名单（确定性规则）→ denyRules（�
 - **⑤ 学习沉淀**（neutral 类别，N=3 时：前 2 次人工确认，之后进入阈值状态）
   - 阈值前：一律人工确认，**批准** → 计数 +1 并记录**操作样本**（指纹 + 操作背景/目的）；**拒绝** → 升级 denyRules
   - 阈值后（计数 ≥ N-1）三种分流：
-    1. **指纹确定性命中**（本次操作在确认样本中）→ 自动放行 + 沉淀 `{tool, mode, category, contains}` 规则
+    1. **指纹确定性命中**（本次操作在确认样本中）→ 自动放行 + 沉淀规则：有实际命令时指纹取命令前缀（如 `git diff`），沉淀为 `{tool, mode, category, command}`；否则取理由中的路径/文件名，沉淀为 `{tool, mode, category, contains}`
     2. **指纹未命中但有确认样本** → 把本次操作的背景/目的 + 用户确认过的样本交给 flash **第三方同类验证**：判 `SAME`（与已确认样本同类）→ 自动放行（有指纹则沉淀）；判 `DIFFERENT`/验证失败 → 人工确认
     3. **无确认样本** → 人工确认
   - 用户**拒绝** → 升级进 denyRules（带指纹；提取不到指纹则拦全部同类，拒绝从严）
@@ -97,7 +99,7 @@ dsh plugin --profile web add "github:moon09300731/dsh-approval-gate#main"
 ```
 
 - `denyKeywords`：命中即转人工（不可逆危险操作）
-- `allowRules`：每条规则 `tool` / `mode` / `category` / `contains` 均满足才放行（缺省表示任意）。学习沉淀的规则也会写入这里
+- `allowRules`：每条规则 `tool` / `mode` / `category` / `contains` / `command` 均满足才放行（缺省表示任意）。`contains` 在理由或实际命令中包含即可；`command` 是实际命令前缀（如 `git status`，复合命令不匹配）。注意 `tool` 是工具名（如 `pwsh`、`bash`），不是命令名。学习沉淀的规则也会写入这里
 - `denyRules`：用户裁决拒绝后自动写入，命中即转人工（不学习）
 - `hardCategories`：flash 判 RISKY 且命中这些类别 → 直接转人工（不计数、不学习）
 - `riskyThreshold`：中立类别的人工确认阈值（默认 3）——同一「工具+模式+类别」被人工确认 N-1 次后，第 N 次起自动放行并沉淀规则

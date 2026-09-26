@@ -299,6 +299,31 @@ function sessionEventsOf(session) {
 }
 
 /**
+ * 按 callId 回溯会话日志中的 tool/call 事件，解析其 arguments。
+ * @param {string|null|undefined} callId approval 请求关联的工具调用 ID
+ * @param {Array} events 会话事件列表（session.events）
+ * @returns {object|null} 参数对象（未命中/解析失败返回 null）
+ */
+function resolveToolCallArgs(callId, events) {
+  if (!callId || !Array.isArray(events) || events.length === 0) return null
+  for (const ev of events) {
+    if (ev && ev.type === 'tool/call' && ev.data && ev.data.callId === callId) {
+      const raw = ev.data.arguments
+      let args = null
+      try { args = typeof raw === 'string' ? JSON.parse(raw) : raw } catch { args = null }
+      return args && typeof args === 'object' ? args : null
+    }
+  }
+  return null
+}
+
+/** 取工具调用的命令文本（bash/pwsh/exec 等的 command/cmd/script 字段），无则返回 '' */
+function commandOf(args) {
+  if (!args) return ''
+  return String(args.command || args.cmd || args.script || '').trim()
+}
+
+/**
  * 从 approval/request 的 callId 回溯会话日志中的 tool/call 事件，取结构化参数里的真实路径。
  * B 层：edit/write/select 等带 file_path 字段的工具 → 解析 arguments JSON 拿确凿路径；
  * bash/exec 等带 command 字段的工具 → 从命令文本提取路径。
@@ -308,16 +333,8 @@ function sessionEventsOf(session) {
  * @returns {string[]|null} 结构化路径数组（未命中返回 null）
  */
 function resolveToolCallFiles(callId, events) {
-  if (!callId || !Array.isArray(events) || events.length === 0) return null
-  let args = null
-  for (const ev of events) {
-    if (ev && ev.type === 'tool/call' && ev.data && ev.data.callId === callId) {
-      const raw = ev.data.arguments
-      try { args = typeof raw === 'string' ? JSON.parse(raw) : raw } catch { args = null }
-      break
-    }
-  }
-  if (!args || typeof args !== 'object') return null
+  const args = resolveToolCallArgs(callId, events)
+  if (!args) return null
   const found = []
   const seen = new Set()
   const addPath = (v) => {
@@ -565,9 +582,9 @@ function applyRuleOp(op, kind, value) {
       }
     } else {
       if (!value || typeof value !== 'object') return { ok: false, error: '规则必须是对象' }
-      const hasAny = value.tool || value.mode || value.category || value.contains
-      if (!hasAny) return { ok: false, error: '规则至少需要 tool/mode/category/contains 之一' }
-      const dup = list.some((r) => r && r.tool === value.tool && r.mode === value.mode && r.category === value.category && r.contains === value.contains)
+      const hasAny = value.tool || value.mode || value.category || value.contains || value.command
+      if (!hasAny) return { ok: false, error: '规则至少需要 tool/mode/category/contains/command 之一' }
+      const dup = list.some((r) => r && sameRule(r, value))
       if (!dup) {
         if (!value.description) value.description = '用户自定义'
         list.push(value)
@@ -588,7 +605,7 @@ function applyRuleOp(op, kind, value) {
       const v = value || {}
       for (let i = list.length - 1; i >= 0; i--) {
         const r = list[i] || {}
-        if (r.tool === v.tool && r.mode === v.mode && r.category === v.category && r.contains === v.contains) list.splice(i, 1)
+        if (sameRule(r, v)) list.splice(i, 1)
       }
       if (list.length !== before) audit(`CONFIG  ${kind} - ${JSON.stringify(v)}`)
     }
@@ -612,7 +629,7 @@ const CATEGORY_LABELS = {
 const SYSTEM_PROMPT = [
   '你是 AI 编程代理的操作风险评估器。DSH 的审批只发生在「沙箱越界」时，即命令需要比当前更宽的权限才能执行。',
   '',
-  '你将收到：工具名、请求升级的目标沙箱模式、以及一句操作理由（justification）。',
+  '你将收到：工具名、请求升级的目标沙箱模式、实际要执行的命令/参数（若有）、以及一句操作理由（justification）。',
   '沙箱模式含义：',
   '- workspace-write：允许写当前工作区（可回补，通常安全）',
   '- danger-full-access：允许写任意文件/系统（不可回补风险高）',
@@ -630,7 +647,10 @@ const SYSTEM_PROMPT = [
   '   neutral —— 以上都不符合（如：工作区外普通文件的常规编辑、模型不确定但无明显硬风险）',
   '',
   '判定原则：',
-  '- 只根据 justification 描述判断，不臆测额外风险',
+  '- 有实际命令时以命令为准：理由只是模型的自述，可能夸大或遗漏；命令与理由不一致时按命令判断',
+  '- 只读命令（查看状态/差异/日志/文件内容、语法检查等不改动任何文件的命令）→ SAFE，即使目标模式是 danger-full-access',
+  '  （沙箱初始化失败时模型会为只读命令申请 danger-full-access，这不代表命令本身危险）',
+  '- 没有实际命令时只根据 justification 描述判断，不臆测额外风险',
   '- 可回补、常规、不触碰敏感资源的操作 → SAFE',
   '- 工作区外写入（如 ~/.dsh、个人项目仓库）本身不构成硬风险：判断的是操作内容，不是路径位置',
   '- 拿不准、但无删除/凭据/远程/系统/批量特征的 → neutral（这是误判补偿区，系统会计数后请用户裁决）',
@@ -734,6 +754,14 @@ function looksDeny(text) {
   return keywords.some((keyword) => lower.includes(String(keyword).toLowerCase()))
 }
 
+// DENY 检查命令文本前的降噪：剥离 `--opt=值` 的选项值（如 git log --pretty=format:"…"）
+// 与 PowerShell 输出格式化 cmdlet（Format-List/Table/Wide/Custom），避免 `format` 等关键词误判
+function commandForDeny(command) {
+  return String(command || '')
+    .replace(/(--[\w-]+)=(?:"[^"]*"|'[^']*'|\S+)/g, '$1')
+    .replace(/\bformat-(?:list|table|wide|custom)\b/gi, ' ')
+}
+
 // reason 格式：`escalate sandbox to <mode>: <justification>`
 function parseReason(reason) {
   const m = String(reason || '').match(/escalate\s+sandbox\s+to\s+([^\s:]+):?\s*([\s\S]*)/i)
@@ -741,15 +769,27 @@ function parseReason(reason) {
   return { mode: '', justification: String(reason || '') }
 }
 
-// 规则匹配：tool / mode / category / contains 均满足（缺省表示任意）
-function matchRule(rules, toolName, mode, category, justification) {
+// 规则匹配：tool / mode / category / contains / command 均满足（缺省表示任意）
+//   contains：在 justification 或实际命令文本中包含（大小写不敏感）
+//   command：实际命令文本前缀匹配（大小写不敏感，如 "git status"）
+function matchRule(rules, toolName, mode, category, justification, command = '') {
   const list = rules || []
   const j = String(justification || '').toLowerCase()
+  const c = String(command || '').trim().toLowerCase().replace(/\s+/g, ' ')
   for (const rule of list) {
     if (rule.tool && rule.tool !== toolName) continue
     if (rule.mode && rule.mode !== mode) continue
     if (rule.category && rule.category !== category) continue
-    if (rule.contains && !j.includes(String(rule.contains).toLowerCase())) continue
+    if (rule.contains) {
+      const needle = String(rule.contains).toLowerCase()
+      if (!j.includes(needle) && !c.includes(needle)) continue
+    }
+    if (rule.command) {
+      // 复合命令（管道/串联/重定向/命令替换）不参与前缀匹配，防止 `git status && rm ...` 借前缀放行
+      if (!c || /[|;&<>`\n\r]|\$\(/.test(c)) continue
+      const prefix = String(rule.command).trim().toLowerCase().replace(/\s+/g, ' ')
+      if (!(c === prefix || c.startsWith(prefix + ' '))) continue
+    }
     return rule
   }
   return null
@@ -799,6 +839,36 @@ function extractOperationFingerprint(text) {
   // 取最长片段（最长最有区分度），截断防超长
   candidates.sort((a, b) => b.length - a.length)
   return candidates[0].slice(0, 60)
+}
+
+/**
+ * 从实际命令提取指纹：前两个词（git 全局参数剥离后），`npm run x` 类取三个词。
+ * 复合命令（管道/串联/重定向）不可作为指纹，返回 null。
+ * @param {string} cmd 命令文本
+ * @returns {string|null} 如 "git diff"、"node --check"、"npm run check"
+ */
+function commandFingerprint(cmd) {
+  const s = String(cmd || '').trim().toLowerCase().replace(/\s+/g, ' ')
+  if (!s || /[|;&<>`\n\r]|\$\(/.test(s)) return null
+  const tokens = s.replace(/^git (?:(?:-c \S+|--no-pager) )+/, 'git ').split(' ')
+  const n = /^(run|exec|x|run-script)$/.test(tokens[1] || '') ? 3 : 2
+  return tokens.slice(0, n).join(' ').slice(0, 60) || null
+}
+
+/**
+ * 操作指纹：有实际命令时优先取命令指纹（写入规则的 command 字段，前缀匹配），
+ * 否则回退 justification 指纹（写入 contains 字段）。
+ * @returns {{fp: string|null, field: 'command'|'contains'}}
+ */
+function operationFingerprint(justification, command) {
+  const cfp = command ? commandFingerprint(command) : null
+  if (cfp) return { fp: cfp, field: 'command' }
+  return { fp: extractOperationFingerprint(justification), field: 'contains' }
+}
+
+/** 规则去重比较：tool/mode/category/contains/command 全等（空串与缺省视为相同） */
+function sameRule(a, b) {
+  return ['tool', 'mode', 'category', 'contains', 'command'].every((k) => (a[k] || '') === (b[k] || ''))
 }
 
 export default {
@@ -1156,10 +1226,11 @@ export default {
      * 单次 flash 判定：输出 SAFE 或 RISKY:<category>。
      * @returns {Promise<{verdict:'safe'|'risky', category?:string}>}
      */
-    const judgeOnce = async (toolName, mode, justification, signal) => {
+    const judgeOnce = async (toolName, mode, justification, command, signal) => {
       const user = [
         `工具: ${toolName}`,
         `目标沙箱模式: ${mode || '(非越界审批)'}`,
+        `实际命令: ${command ? command.slice(0, 2000) : '(无)'}`,
         `操作理由: ${justification || '(无说明)'}`,
         '',
         '请判断：执行该操作是否会造成无法回补的后果或触碰敏感资源？输出 SAFE 或 RISKY:<类别>。'
@@ -1189,7 +1260,7 @@ export default {
       '- 一个新操作的背景和目的',
       '',
       '判断规则：',
-      '- SAME：新操作与某个样本属于同类操作——操作对象（同一文件/目录/项目/配置/系统）或目的（同一类例行维护、同一次任务的延续）一致或高度相似',
+      '- SAME：新操作与某个样本属于同类操作——实际命令属于同一类（如都是只读 git 查看），或操作对象（同一文件/目录/项目/配置/系统）或目的（同一类例行维护、同一次任务的延续）一致或高度相似',
       '- DIFFERENT：新操作的操作对象或目的与所有样本明显不同（不同文件/不同系统/不同性质的操作）',
       '',
       '只输出一个词：SAME 或 DIFFERENT。拿不准时输出 DIFFERENT。不要输出任何其他内容。'
@@ -1200,7 +1271,7 @@ export default {
      * 判断是否属于已确认的同类操作（语义级，不依赖关键词）。
      * @returns {Promise<{verdict:'same'|'different'}>}
      */
-    const verifySimilarity = async (toolName, mode, justification, samples, signal) => {
+    const verifySimilarity = async (toolName, mode, justification, command, samples, signal) => {
       const sampleLines = samples
         .map((s, i) => `样本${i + 1}: ${s.ctx || s.fp || '(无描述)'}`)
         .join('\n')
@@ -1212,6 +1283,7 @@ export default {
         sampleLines || '（无样本）',
         '',
         '【本次新操作】',
+        `实际命令: ${command ? command.slice(0, 500) : '(无)'}`,
         `操作理由: ${justification || '(无说明)'}`,
         '',
         '请判断：新操作是否与某个已批准样本属于同类操作？输出 SAME 或 DIFFERENT。'
@@ -1269,23 +1341,23 @@ export default {
     }
 
     /** flash 风险判定（带超时重试）：失败 → { verdict:'risky', category:'neutral', failed:true }（fail-safe） */
-    const judgeWithFlash = async (toolName, mode, justification) => {
-      const result = await withRetry((signal) => judgeOnce(toolName, mode, justification, signal), 'flash 判断')
+    const judgeWithFlash = async (toolName, mode, justification, command) => {
+      const result = await withRetry((signal) => judgeOnce(toolName, mode, justification, command, signal), 'flash 判断')
       if (result.failed) return { verdict: 'risky', category: 'neutral', timedOut: true, failed: true }
       return result
     }
 
     /** 同类验证（带超时重试）：失败 → { verdict:'different', failed:true }（fail-safe：验证失败按不同类处理） */
-    const verifySimilarityWithRetry = async (toolName, mode, justification, samples) => {
-      const result = await withRetry((signal) => verifySimilarity(toolName, mode, justification, samples, signal), '同类验证')
+    const verifySimilarityWithRetry = async (toolName, mode, justification, command, samples) => {
+      const result = await withRetry((signal) => verifySimilarity(toolName, mode, justification, command, samples, signal), '同类验证')
       if (result.failed) return { verdict: 'different', failed: true }
       return result
     }
 
     /** 记录一次人工批准的样本（{fp, ctx}）；同指纹覆盖旧样本；返回本次指纹（可能为 null） */
-    const recordSample = (key, justification) => {
-      const fp = extractOperationFingerprint(justification)
-      const ctx = String(justification || '').slice(0, 200)
+    const recordSample = (key, justification, command) => {
+      const { fp } = operationFingerprint(justification, command)
+      const ctx = (command ? `命令: ${command.slice(0, 120)} | 理由: ` : '') + String(justification || '').slice(0, 200)
       const list = (learning.history[key] || []).slice()
       const idx = fp ? list.findIndex((s) => s.fp === fp) : -1
       if (idx >= 0) list[idx] = { fp, ctx }
@@ -1326,6 +1398,17 @@ export default {
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
         const toolFiles = resolveToolCallFiles(req.callId, events)
         const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
+        // 实际命令（bash/pwsh 等）：供 DENY/白名单/flash/指纹按真实操作判断，而非只看模型自述的 justification
+        const command = commandOf(resolveToolCallArgs(req.callId, events))
+        const cmdTag = command ? ` cmd=${JSON.stringify(command.slice(0, 80))}` : ''
+        // 操作指纹（命令优先）：沉淀/拒绝规则的匹配依据
+        const { fp: fingerprint, field: fpField } = operationFingerprint(justification, command)
+        const learnedRuleOf = (cat) => {
+          const rule = { tool: toolName, category: cat }
+          if (mode) rule.mode = mode
+          if (fingerprint) rule[fpField] = fingerprint
+          return rule
+        }
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
         const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why) => {
@@ -1340,24 +1423,24 @@ export default {
         }
 
         // 1. DENY 层：不可逆危险词 → 转人工（fail-safe，最高优先）
-        if (looksDeny(toolName + ' ' + reason)) {
-          audit(`DENY    ${toolName} mode=${mode || 'none'} | ${reason.slice(0, 160)}`)
+        if (looksDeny(toolName + ' ' + reason + ' ' + commandForDeny(command))) {
+          audit(`DENY    ${toolName} mode=${mode || 'none'}${cmdTag} | ${reason.slice(0, 160)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, '', 'deny')
         }
 
         // 2. 白名单层：命中规则 → 直接放行（确定性，不过 flash）
-        const matchedRule = matchRule(config.allowRules, toolName, mode, null, justification)
+        const matchedRule = matchRule(config.allowRules, toolName, mode, null, justification, command)
         if (matchedRule) {
-          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})`)
+          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${matchedRule.description || 'matched'})${cmdTag}`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'rule', filesOpt)
           return 'allowed-once'
         }
 
         // 3. flash 判定
-        const { verdict, category, timedOut, failed } = await judgeWithFlash(toolName, mode, justification)
+        const { verdict, category, timedOut, failed } = await judgeWithFlash(toolName, mode, justification, command)
 
         if (verdict === 'safe') {
-          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (flash-safe${timedOut ? '，重试后' : ''})`)
+          audit(`ALLOW   ${toolName} mode=${mode || 'none'} (flash-safe${timedOut ? '，重试后' : ''})${cmdTag}`)
           recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-safe', filesOpt)
           return 'allowed-once'
         }
@@ -1366,32 +1449,32 @@ export default {
 
         // 4a. flash 完全失败（超时×2/异常×2）→ 转人工（fail-safe：无法判断绝不自动放行）
         if (failed) {
-          audit(`FAILED  ${toolName} mode=${mode || 'none'} → 人工 | ${reason.slice(0, 120)}`)
+          audit(`FAILED  ${toolName} mode=${mode || 'none'}${cmdTag} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'flash-failed')
         }
 
         // 4b. 硬风险类别（deletion/credential/remote/system/bulk）→ 直接转人工（必须人工确认，不计数不学习）
         const hard = config.hardCategories || DEFAULT_HARD_CATEGORIES
         if (hard.includes(cat)) {
-          audit(`HARD    ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
+          audit(`HARD    ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'hard-category')
         }
 
         // 4c. 协议外类别（模型输出未知类别）→ 判定不可靠，fail-safe 转人工
         if (cat !== 'neutral') {
-          audit(`UNKNOWN ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
+          audit(`UNKNOWN ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'unknown-category')
         }
 
         // 4d. denyRules 命中（此前用户裁决拒绝过的 key）→ 直接转人工（拒绝优先于沉淀）
-        if (matchRule(config.denyRules, toolName, mode, cat, justification)) {
-          audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat} → 人工 | ${reason.slice(0, 120)}`)
+        if (matchRule(config.denyRules, toolName, mode, cat, justification, command)) {
+          audit(`DENYRULE ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} → 人工 | ${reason.slice(0, 120)}`)
           return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'deny-rule')
         }
 
         // 4e. 沉淀规则（带 category 的学习规则，用户批准过）→ 直接放行，不再计数
         const key = learnKey(toolName, mode, cat)
-        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, justification)
+        const learnedRule = matchRule(config.allowRules, toolName, mode, cat, justification, command)
         if (learnedRule) {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (rule: ${learnedRule.description || '沉淀规则'})`)
           delete learning.stats[key]
@@ -1406,16 +1489,14 @@ export default {
         const confirmed = learning.stats[key] || 0
 
         if (confirmed >= threshold) {
-          const fingerprint = extractOperationFingerprint(justification)
           const samples = learning.history[key] || []
           const fpHit = Boolean(fingerprint) && samples.some((s) => s.fp === fingerprint)
 
           if (fpHit) {
             // ① 指纹确定性命中（用户确认过该操作）→ 自动放行 + 沉淀规则
             if (learning.enabled) {
-              const rule = { tool: toolName, category: cat, contains: fingerprint }
-              if (mode) rule.mode = mode
-              if (!config.allowRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)) {
+              const rule = learnedRuleOf(cat)
+              if (!config.allowRules.some((r) => sameRule(r, rule))) {
                 rule.description = `自动沉淀：${cat === 'neutral' ? '中立' : CATEGORY_LABELS[cat] || cat} 人工确认后自动放行`
                 config.allowRules.push(rule)
                 saveJson(ALLOWLIST_PATH, config)
@@ -1433,13 +1514,12 @@ export default {
           if (samples.length > 0) {
             // 指纹未命中 → flash 第三方同类验证：把本次操作背景 + 用户确认样本给 flash，
             // 语义判断是否属于已确认的同类操作（不依赖关键词）
-            const sim = await verifySimilarityWithRetry(toolName, mode, justification, samples)
+            const sim = await verifySimilarityWithRetry(toolName, mode, justification, command, samples)
             if (sim.verdict === 'same') {
               // 判同类 → 自动放行；有指纹则沉淀规则（无指纹不沉淀，保留样本供后续验证）
               if (learning.enabled && fingerprint) {
-                const rule = { tool: toolName, category: cat, contains: fingerprint }
-                if (mode) rule.mode = mode
-                if (!config.allowRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)) {
+                const rule = learnedRuleOf(cat)
+                if (!config.allowRules.some((r) => sameRule(r, rule))) {
                   rule.description = `自动沉淀：${cat === 'neutral' ? '中立' : CATEGORY_LABELS[cat] || cat} flash 同类验证`
                   config.allowRules.push(rule)
                   saveJson(ALLOWLIST_PATH, config)
@@ -1450,32 +1530,30 @@ export default {
                 saveJson(LEARNING_PATH, learning)
               } else {
                 // 无指纹：不沉淀，保留样本与阈值位（下次同操作仍靠 flash 验证放行）
-                audit(`SAME    ${toolName} mode=${mode || 'none'} category=${cat} flash 判同类（无指纹，未沉淀）| ${reason.slice(0, 100)}`)
+                audit(`SAME    ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} flash 判同类（无指纹，未沉淀）| ${reason.slice(0, 100)}`)
               }
               audit(`ALLOW   ${toolName} mode=${mode || 'none'} (flash-same) | ${reason.slice(0, 100)}`)
               recordAutoAllow(sessionId, toolName, mode, reason, justification, 'flash-same', filesOpt)
               return 'allowed-once'
             }
             // 判 DIFFERENT / 验证失败 → 落人工确认
-            audit(`SIMDIFF ${toolName} mode=${mode || 'none'} category=${cat} flash 判不同类 → 人工 | ${reason.slice(0, 120)}`)
+            audit(`SIMDIFF ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} flash 判不同类 → 人工 | ${reason.slice(0, 120)}`)
           }
 
           // 指纹未命中（且无样本可验证 / 判不同类）：转人工确认
-          audit(`RISKY   ${toolName} mode=${mode || 'none'} category=${cat} confirm=${confirmed + 1}/${threshold}（操作未确认过）→ 人工 outcome=? | ${reason.slice(0, 120)}`)
+          audit(`RISKY   ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} confirm=${confirmed + 1}/${threshold}（操作未确认过）→ 人工 outcome=? | ${reason.slice(0, 120)}`)
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat, path: 'neutral-confirm' }, filesOpt))
           const outcome = await next()
           audit(`OUTCOME ${key} outcome=${outcome} | ${reason.slice(0, 80)}`)
           if (outcome === 'allowed-once' && learning.enabled) {
             // 批准 → 记录本次操作样本（背景+指纹）；计数保持阈值位
-            recordSample(key, justification)
+            recordSample(key, justification, command)
             saveJson(LEARNING_PATH, learning)
             recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed, threshold, category: cat, path: 'neutral-confirm' }, filesOpt))
           } else if (outcome === 'rejected') {
             // 拒绝 → 永久人工（带指纹；提取不到则拦全部同类，拒绝从严）
-            const rule = { tool: toolName, category: cat }
-            if (mode) rule.mode = mode
-            if (fingerprint) rule.contains = fingerprint
-            if (!config.denyRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)) {
+            const rule = learnedRuleOf(cat)
+            if (!config.denyRules.some((r) => sameRule(r, rule))) {
               config.denyRules.push(rule)
               saveJson(ALLOWLIST_PATH, config)
               audit(`LEARN   ${key} 被人工拒绝，已升级永久人工 ${JSON.stringify(rule)}`)
@@ -1489,7 +1567,7 @@ export default {
         }
 
         // 前 N 次 → 人工确认
-        audit(`RISKY   ${toolName} mode=${mode || 'none'} category=${cat} confirm=${confirmed + 1}/${threshold} → 人工 outcome=? | ${reason.slice(0, 120)}`)
+        audit(`RISKY   ${toolName} mode=${mode || 'none'} category=${cat}${cmdTag} confirm=${confirmed + 1}/${threshold} → 人工 outcome=? | ${reason.slice(0, 120)}`)
         recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat, path: 'neutral-confirm' }, filesOpt))
         const outcome = await next()
         audit(`OUTCOME ${key} outcome=${outcome} | ${reason.slice(0, 80)}`)
@@ -1497,16 +1575,13 @@ export default {
         if (outcome === 'allowed-once' && learning.enabled) {
           // 批准 → 确认计数 +1，并记录本次操作样本（未达阈值，下次同类仍人工确认）
           learning.stats[key] = confirmed + 1
-          recordSample(key, justification)
+          recordSample(key, justification, command)
           saveJson(LEARNING_PATH, learning)
           recordApprovalEvent(sessionId, toolName, mode, reason, justification, 'manual-approved', Object.assign({ kind: 'manual-approved', learningCount: confirmed + 1, threshold, category: cat, path: 'neutral-confirm' }, filesOpt))
         } else if (outcome === 'rejected') {
           // 拒绝 → 升级为永久人工规则（带操作指纹；提取不到则拦全部同类，拒绝从严）
-          const fingerprint = extractOperationFingerprint(justification)
-          const rule = { tool: toolName, category: cat }
-          if (mode) rule.mode = mode
-          if (fingerprint) rule.contains = fingerprint
-          if (!config.denyRules.some((r) => r.tool === rule.tool && r.mode === rule.mode && r.category === rule.category && r.contains === rule.contains)) {
+          const rule = learnedRuleOf(cat)
+          if (!config.denyRules.some((r) => sameRule(r, rule))) {
             config.denyRules.push(rule)
             saveJson(ALLOWLIST_PATH, config)
             audit(`LEARN   ${key} 被人工拒绝，已升级永久人工 ${JSON.stringify(rule)}`)
