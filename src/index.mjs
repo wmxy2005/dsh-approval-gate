@@ -1287,10 +1287,15 @@ export default {
         if (!session) return next()
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          // 新版 DSH：current(session)；旧版：current(events)
+          preset = permissionPresets.current(session)
         } catch (error) {
-          console.error(`[${NAME}] permissionPresets.current failed`, error)
-          return next()
+          try {
+            preset = permissionPresets.current(session.events)
+          } catch {
+            console.error(`[${NAME}] permissionPresets.current failed`, error)
+            return next()
+          }
         }
         if (preset !== PRESET_NAME) return next()
         if (req.signal && req.signal.aborted) return next()
